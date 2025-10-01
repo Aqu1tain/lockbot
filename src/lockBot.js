@@ -7,6 +7,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageFlags,
 } = require('discord.js');
 const { randomUUID } = require('node:crypto');
 const { StateManager } = require('./stateManager');
@@ -143,8 +144,21 @@ function createLockBot({
     return { ...payload };
   }
 
+  function applyEphemeralFlags(payload, ephemeral) {
+    if (!ephemeral) {
+      return payload;
+    }
+
+    return {
+      ...payload,
+      flags: typeof payload.flags === 'number' ? payload.flags | MessageFlags.Ephemeral : MessageFlags.Ephemeral,
+    };
+  }
+
   async function safeReply(interaction, payload, { ephemeral = true } = {}) {
-    const normalized = normalizeReplyPayload(payload);
+    const normalizedBase = normalizeReplyPayload(payload);
+    const normalized = applyEphemeralFlags(normalizedBase, ephemeral);
+    delete normalized.ephemeral;
 
     if (!normalized.content && !normalized.embeds && !normalized.components && !normalized.files) {
       normalized.content = '\u200b';
@@ -156,11 +170,11 @@ function createLockBot({
         return;
       }
 
-      await interaction.reply({ ...normalized, ephemeral });
+      await interaction.reply(normalized);
     } catch (error) {
       if (error?.code === 10008) {
         try {
-          await interaction.followUp({ ...normalized, ephemeral });
+          await interaction.followUp(normalized);
         } catch (followError) {
           logger.error('Failed to send follow-up after edit failure', followError);
         }
@@ -168,6 +182,23 @@ function createLockBot({
       }
 
       throw error;
+    }
+  }
+
+  async function safeFollowUp(interaction, payload, { ephemeral = true } = {}) {
+    const normalized = applyEphemeralFlags(normalizeReplyPayload(payload), ephemeral);
+    delete normalized.ephemeral;
+
+    if (!normalized.content && !normalized.embeds && !normalized.components && !normalized.files) {
+      normalized.content = '\u200b';
+    }
+
+    try {
+      await interaction.followUp(normalized);
+    } catch (error) {
+      if (error?.code !== 10008) {
+        throw error;
+      }
     }
   }
 
@@ -502,9 +533,8 @@ function createLockBot({
         }
 
         if (interaction.user.id !== action.userId) {
-          await interaction.reply({
+          await safeReply(interaction, {
             content: `Only <@${action.userId}> can confirm this action.`,
-            ephemeral: true,
           }).catch(() => {});
           return;
         }
@@ -559,10 +589,12 @@ function createLockBot({
               });
               await interaction.editReply({ embeds: [embed], components: [] });
             } catch (editError) {
-              logWarn('Failed to update confirmation message after enabling maintenance', editError);
+              if (editError?.code !== 10008) {
+                logWarn('Failed to update confirmation message after enabling maintenance', editError);
+              }
             }
 
-            await interaction.followUp({ content: result.reply, ephemeral: true }).catch(() => {});
+            await safeFollowUp(interaction, { content: result.reply }).catch(() => {});
           } else {
             const result = await performMaintenanceDisable({ guild, requestedById: stored.userId });
 
@@ -575,16 +607,17 @@ function createLockBot({
               });
               await interaction.editReply({ embeds: [embed], components: [] });
             } catch (editError) {
-              logWarn('Failed to update confirmation message after disabling maintenance', editError);
+              if (editError?.code !== 10008) {
+                logWarn('Failed to update confirmation message after disabling maintenance', editError);
+              }
             }
 
-            await interaction.followUp({ content: result.reply, ephemeral: true }).catch(() => {});
+            await safeFollowUp(interaction, { content: result.reply }).catch(() => {});
           }
         } catch (error) {
           logger.error('Failed to perform maintenance action', error);
-          await interaction.followUp({
+          await safeFollowUp(interaction, {
             content: 'Failed to apply maintenance changes. Check the bot logs.',
-            ephemeral: true,
           }).catch(() => {});
         }
 
@@ -597,7 +630,7 @@ function createLockBot({
 
       const guild = interaction.guild;
       if (!guild) {
-        await interaction.reply({ content: 'This interaction only works inside a server.', ephemeral: true }).catch(() => {});
+        await safeReply(interaction, { content: 'This interaction only works inside a server.' }).catch(() => {});
         return;
       }
 
@@ -605,7 +638,7 @@ function createLockBot({
 
       if (customId === MAINTENANCE_STATUS_BUTTON_ID) {
         const embed = buildStatusEmbed(guild, state);
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await safeReply(interaction, { embeds: [embed] });
         return;
       }
 
@@ -618,7 +651,7 @@ If you need urgent help, reach out to an administrator.`,
           color: EMBED_COLORS.info,
           footer: { text: guild.name },
         });
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        await safeReply(interaction, { embeds: [embed] });
         return;
       }
 
@@ -636,14 +669,13 @@ If you need urgent help, reach out to an administrator.`,
 
     const memberPermissions = interaction.memberPermissions;
     if (!memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-      await interaction.reply({
+      await safeReply(interaction, {
         content: 'You need administrator permissions to manage maintenance mode.',
-        ephemeral: true,
       });
       return;
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
       const subcommand = interaction.options.getSubcommand();
