@@ -1,6 +1,6 @@
 require('dotenv').config();
 
-const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder } = require('discord.js');
 
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.CLIENT_ID;

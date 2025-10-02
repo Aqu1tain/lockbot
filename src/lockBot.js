@@ -220,6 +220,31 @@ function createLockBot({
       });
     }
 
+    if (state.memberRoleSnapshots) {
+      const lockedCount = Object.keys(state.memberRoleSnapshots).length;
+      fields.push({
+        name: 'Members Restricted',
+        value: `${lockedCount}`,
+        inline: true,
+      });
+    }
+
+    if (state.maintenanceTempRoleId) {
+      fields.push({
+        name: 'Temporary Role',
+        value: `<@&${state.maintenanceTempRoleId}>`,
+        inline: true,
+      });
+    }
+
+    if (state.maintenanceBypassRoleId) {
+      fields.push({
+        name: 'Bypass Role',
+        value: `<@&${state.maintenanceBypassRoleId}>`,
+        inline: true,
+      });
+    }
+
     if (state.timeoutAt) {
       const timeoutUnix = Math.floor(new Date(state.timeoutAt).getTime() / 1000);
       const timeoutSetBy = state.timeoutSetBy ? ` (set by <@${state.timeoutSetBy}>)` : '';
@@ -280,8 +305,15 @@ function createLockBot({
 
     const timeoutUnix = timeoutAt ? Math.floor(new Date(timeoutAt).getTime() / 1000) : null;
 
+    const lockedCount = Object.keys(state.memberRoleSnapshots || {}).length;
+
     const fields = [
       { name: 'Triggered by', value: `<@${requestedById}>`, inline: true },
+      {
+        name: 'Members Locked',
+        value: `${lockedCount}`,
+        inline: true,
+      },
       {
         name: 'Scheduled Restore',
         value: timeoutUnix
@@ -310,7 +342,7 @@ function createLockBot({
     stateCache.set(guild.id, state);
     scheduleAutoDisable(guild, state);
 
-    let reply = 'Maintenance mode enabled. All non-admin users are restricted to the maintenance channel.';
+    let reply = `Maintenance mode enabled. Locked ${lockedCount} member${lockedCount === 1 ? '' : 's'} to the maintenance role.`;
     if (timeoutUnix) {
       reply += ` Auto-disable scheduled for <t:${timeoutUnix}:f> (<t:${timeoutUnix}:R>).`;
     }
@@ -347,7 +379,8 @@ function createLockBot({
     clearAutoDisable(guild.id);
     stateCache.set(guild.id, state);
 
-    const reply = 'Maintenance mode disabled. Channel permissions restored.';
+    const expectedRestoreCount = Object.keys(stateBeforeDisable.memberRoleSnapshots || {}).length;
+    const reply = `Maintenance mode disabled. Restored up to ${expectedRestoreCount} member${expectedRestoreCount === 1 ? '' : 's'}.`;
 
     return { state, reply };
   }
@@ -488,27 +521,6 @@ function createLockBot({
     }
 
     await stateManager.deleteGuildState(guild.id);
-  });
-
-  client.on(Events.ChannelCreate, async (channel) => {
-    const guild = channel.guild;
-    if (!guild || channel.isThread?.()) {
-      return;
-    }
-
-    const state = stateCache.get(guild.id) ?? (await refreshGuildState(guild.id));
-    if (!state.enabled) {
-      return;
-    }
-
-    try {
-      const updatedState = await maintenanceManager.applyRestrictionsToChannel(guild, channel);
-      if (updatedState) {
-        stateCache.set(guild.id, updatedState);
-      }
-    } catch (error) {
-      logger.error(`Failed to lock down new channel ${channel.id} during maintenance`, error);
-    }
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
@@ -827,6 +839,15 @@ If you need urgent help, reach out to an administrator.`,
 
   client.on(Events.GuildMemberAdd, async (member) => {
     const state = stateCache.get(member.guild.id) ?? (await refreshGuildState(member.guild.id));
+
+    if (state.enabled && state.maintenanceTempRoleId) {
+      try {
+        await member.roles.add(state.maintenanceTempRoleId, 'Maintenance mode active');
+      } catch (error) {
+        logger.error(`Failed to assign maintenance temp role to ${member.user.tag}`, error);
+      }
+    }
+
     const targetChannelId = state.enabled
       ? state.maintenanceChannelId
       : member.guild.systemChannelId;

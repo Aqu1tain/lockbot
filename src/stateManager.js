@@ -5,10 +5,16 @@ const DEFAULT_GUILD_STATE = {
   enabled: false,
   maintenanceChannelId: null,
   shouldDeleteMaintenanceChannel: false,
-  overwrites: {},
+  maintenanceTempRoleId: null,
+  shouldDeleteTempRole: false,
+  maintenanceBypassRoleId: null,
+  shouldDeleteBypassRole: false,
+  memberRoleSnapshots: {},
+  everyoneViewPermission: null,
   timeoutAt: null,
   timeoutSetBy: null,
   lastAnnouncement: null,
+  logs: [],
 };
 
 const DEFAULT_STATE = {

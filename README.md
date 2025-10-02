@@ -66,16 +66,19 @@ You can further customise the bot by adjusting the `maintenanceChannelName`, sup
 
 ## Commands
 
-- `/maintenance enable [duration_minutes]` — Hide all channels from non-admin roles, move members to the maintenance channel, and optionally auto-disable after the specified minutes.
-- `/maintenance disable` — Restore channel visibility and optionally remove the temporary maintenance channel.
+- `/maintenance enable [duration_minutes]` — Swap every non-admin/non-bot member into the zero-permission `maintenance-temp` role, strip `View Channel` from `@everyone`, open the maintenance room, and optionally auto-disable after the specified minutes.
+- `/maintenance disable` — Restore saved role assignments, reapply the original `@everyone` permission state, and optionally remove the temporary maintenance channel/roles.
 - `/maintenance status` — Display the current state, including any scheduled auto-timeout and the last broadcast message time.
 - `/maintenance message <content>` — Post an update into the maintenance channel with a neat embed and interaction buttons.
 - Maintenance channel buttons let members check the current status or get friendly guidance without pinging staff.
 - Enable/disable commands prompt the initiating admin for confirmation before changes apply.
+- Any permission edits you make during maintenance stick around—LockBot only reverts overwrites it is still actively enforcing.
+
+During maintenance the bot automatically ensures two helper roles exist: `maintenance-temp` (assigned to all affected members) and `maintenance-bypass` (granting permanent visibility for staff you assign it to). Feel free to tweak permissions while maintenance is active—the bot only restores overwrites it is still enforcing, so any manual edits you make remain in place after the unlock.
 
 ## State Persistence
 
-The bot keeps per-guild state in the JSON file configured by `stateFile` (defaults to `data/state.json`). Do not delete this file while maintenance mode is active, otherwise channel visibility may not be fully restored.
+The bot keeps per-guild state in the JSON file configured by `stateFile` (defaults to `data/state.json`). That includes each locked member's original role list, auto-timeout settings, and announcement history. Do not delete this file while maintenance mode is active, otherwise role restoration may be incomplete.
 
 ## Troubleshooting
 
