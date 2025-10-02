@@ -1,4 +1,4 @@
-const fs = require('fs/promises');
+git const fs = require('fs/promises');
 const path = require('path');
 
 const DEFAULT_GUILD_STATE = {
@@ -11,6 +11,7 @@ const DEFAULT_GUILD_STATE = {
   shouldDeleteBypassRole: false,
   memberRoleSnapshots: {},
   channelPermissionSnapshots: {},
+  roleChannelSnapshots: {},
   everyoneViewPermission: null,
   timeoutAt: null,
   timeoutSetBy: null,

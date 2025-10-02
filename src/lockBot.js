@@ -8,6 +8,7 @@ const {
   ButtonBuilder,
   ButtonStyle,
   MessageFlags,
+  StringSelectMenuBuilder,
 } = require('discord.js');
 const { randomUUID } = require('node:crypto');
 const { StateManager } = require('./stateManager');
@@ -34,6 +35,9 @@ function createLockBot({
   const MAINTENANCE_HELP_BUTTON_ID = 'maintenance_help';
   const MAINTENANCE_CONFIRM_PREFIX = 'maintenance_confirm:';
   const MAINTENANCE_CANCEL_PREFIX = 'maintenance_cancel:';
+  const MAINTENANCE_ROLE_SELECT_PREFIX = 'maintenance_role_select:';
+  const MAINTENANCE_ROLE_RESOLVE_PREFIX = 'maintenance_role_resolve:';
+  const ROLE_SELECT_SKIP_VALUE = 'skip';
   const PENDING_ACTION_TTL_MS = 2 * 60 * 1000;
   const CONFIRMATION_PROMPT_MINUTES = Math.max(1, Math.round(PENDING_ACTION_TTL_MS / 60000));
 
@@ -230,7 +234,7 @@ function createLockBot({
     }
 
     if (state.channelPermissionSnapshots) {
-      const channelsLocked = Object.keys(state.channelPermissionSnapshots).length;
+      const channelsLocked = state.channelsLockedCount ?? Object.keys(state.channelPermissionSnapshots || {}).length;
       fields.push({
         name: 'Channels Locked',
         value: `${channelsLocked}`,
@@ -298,6 +302,113 @@ function createLockBot({
     });
   }
 
+  function collectMissingRoles(guild, state) {
+    const missing = new Map();
+    const roleSnapshots = state.roleChannelSnapshots || {};
+
+    for (const snapshot of Object.values(state.memberRoleSnapshots || {})) {
+      for (const roleId of snapshot.roles || []) {
+        if (missing.has(roleId)) {
+          continue;
+        }
+
+        if (guild.roles.cache.has(roleId)) {
+          continue;
+        }
+
+        const entry = roleSnapshots[roleId];
+        missing.set(roleId, {
+          id: roleId,
+          name: entry?.name || `Deleted role (${roleId})`,
+        });
+      }
+    }
+
+    return Array.from(missing.values());
+  }
+
+  function buildRoleResolutionMessage(action, guild) {
+    const state = stateCache.get(guild.id) ?? {};
+    const tempRoleId = state.maintenanceTempRoleId;
+    const bypassRoleId = state.maintenanceBypassRoleId;
+    const excludedRoleIds = new Set([guild.roles.everyone.id]);
+    if (tempRoleId) excludedRoleIds.add(tempRoleId);
+    if (bypassRoleId) excludedRoleIds.add(bypassRoleId);
+
+    const availableRoles = guild.roles.cache
+      .filter((role) => !excludedRoleIds.has(role.id))
+      .sort((a, b) => b.position - a.position)
+      .first(24)
+      .map((role) => ({
+        label: (role.name || role.id).slice(0, 100),
+        value: role.id,
+      }));
+
+    const fields = action.missingRoles.map((missing) => {
+      const decision = action.decisions?.[missing.id];
+      let value = 'Awaiting decision';
+      if (decision) {
+        if (decision.mode === 'remove') {
+          value = 'Remove role from members';
+        } else if (decision.mode === 'replace') {
+          value = `Replace with <@&${decision.targetRoleId}>`;
+        }
+      }
+
+      return {
+        name: missing.name,
+        value,
+        inline: false,
+      };
+    });
+
+    const embed = buildMaintenanceEmbed({
+      title: 'Resolve Missing Roles',
+      description:
+        'Some roles referenced during maintenance no longer exist. Choose a replacement role or remove the role from affected members before completing the restore.',
+      color: EMBED_COLORS.warning,
+      fields,
+      footer: { text: guild.name },
+    });
+
+    const unresolved = action.missingRoles.filter((missing) => !action.decisions?.[missing.id]);
+
+    const components = [];
+    if (unresolved.length > 0) {
+      const next = unresolved[0];
+      const options = [
+        {
+          label: 'Remove role from members (skip)',
+          value: ROLE_SELECT_SKIP_VALUE,
+          description: 'Members will not receive a replacement role',
+        },
+        ...availableRoles,
+      ];
+
+      const select = new StringSelectMenuBuilder()
+        .setCustomId(`${MAINTENANCE_ROLE_SELECT_PREFIX}${action.id}:${next.id}`)
+        .setPlaceholder(`Replacement for ${next.name}`)
+        .addOptions(options);
+
+      components.push(new ActionRowBuilder().addComponents(select));
+    }
+
+    const confirmButton = new ButtonBuilder()
+      .setCustomId(`${MAINTENANCE_ROLE_RESOLVE_PREFIX}${action.id}:confirm`)
+      .setLabel('Apply Maintenance Restore')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(unresolved.length > 0);
+
+    const cancelButton = new ButtonBuilder()
+      .setCustomId(`${MAINTENANCE_ROLE_RESOLVE_PREFIX}${action.id}:cancel`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary);
+
+    components.push(new ActionRowBuilder().addComponents(confirmButton, cancelButton));
+
+    return { embed, components };
+  }
+
   async function performMaintenanceEnable({ guild, requestedById, durationMinutes }) {
     let timeoutAt = null;
     let timeoutSetBy = null;
@@ -316,7 +427,7 @@ function createLockBot({
 
     const lockedCount = Object.keys(state.memberRoleSnapshots || {}).length;
 
-    const channelsLocked = Object.keys(state.channelPermissionSnapshots || {}).length;
+    const channelsLocked = state.channelsLockedCount ?? Object.keys(state.channelPermissionSnapshots || {}).length;
 
     const fields = [
       { name: 'Triggered by', value: `<@${requestedById}>`, inline: true },
@@ -366,8 +477,32 @@ function createLockBot({
     return { state, timeoutAt, reply };
   }
 
-  async function performMaintenanceDisable({ guild, requestedById }) {
+  async function performMaintenanceDisable({ guild, requestedById, roleMapping = null }) {
+    await guild.roles.fetch().catch(() => {});
+
     const stateBeforeDisable = stateCache.get(guild.id) ?? (await refreshGuildState(guild.id));
+
+    const missingRoles = collectMissingRoles(guild, stateBeforeDisable);
+    if (missingRoles.length > 0) {
+      if (!roleMapping) {
+        return { missingRoles, state: stateBeforeDisable };
+      }
+
+      const unresolved = missingRoles.filter((info) => {
+        const decision = roleMapping[info.id];
+        if (!decision) {
+          return true;
+        }
+        if (decision.action === 'replace' && !guild.roles.cache.has(decision.targetRoleId)) {
+          return true;
+        }
+        return false;
+      });
+
+      if (unresolved.length > 0) {
+        return { missingRoles: unresolved, state: stateBeforeDisable };
+      }
+    }
 
     if (stateBeforeDisable.enabled && !stateBeforeDisable.shouldDeleteMaintenanceChannel) {
       try {
@@ -391,7 +526,7 @@ function createLockBot({
       }
     }
 
-    const state = await maintenanceManager.disable(guild);
+    const state = await maintenanceManager.disable(guild, { roleMapping: roleMapping ?? {} });
     clearAutoDisable(guild.id);
     stateCache.set(guild.id, state);
 
@@ -399,7 +534,7 @@ function createLockBot({
     const expectedChannelCount = Object.keys(stateBeforeDisable.channelPermissionSnapshots || {}).length;
     const reply = `Maintenance mode disabled. Restored up to ${expectedRestoreCount} member${expectedRestoreCount === 1 ? '' : 's'} and ${expectedChannelCount} channel${expectedChannelCount === 1 ? '' : 's'}.`;
 
-    return { state, reply };
+    return { state, reply, missingRoles: [] };
   }
 
   function clearAutoDisable(guildId) {
@@ -541,8 +676,149 @@ function createLockBot({
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
+    if (interaction.isStringSelectMenu()) {
+      const { customId } = interaction;
+      if (!customId.startsWith(MAINTENANCE_ROLE_SELECT_PREFIX)) {
+        return;
+      }
+
+      const guild = interaction.guild;
+      if (!guild) {
+        await safeReply(interaction, { content: 'This interaction only works inside a server.' }).catch(() => {});
+        return;
+      }
+
+      const [actionId, missingRoleId] = customId.slice(MAINTENANCE_ROLE_SELECT_PREFIX.length).split(':');
+      const action = getPendingAction(actionId);
+
+      if (!action || action.type !== 'disableResolve' || action.guildId !== guild.id) {
+        await interaction.update({
+          embeds: [
+            buildMaintenanceEmbed({
+              title: 'Request Expired',
+              description: 'This maintenance request is no longer available. Please run the command again.',
+              color: EMBED_COLORS.info,
+              footer: { text: guild?.name ?? 'Maintenance' },
+            }),
+          ],
+          components: [],
+        }).catch(() => {});
+        return;
+      }
+
+      if (interaction.user.id !== action.userId) {
+        await safeReply(interaction, {
+          content: `Only <@${action.userId}> can adjust this restore.`,
+        }).catch(() => {});
+        return;
+      }
+
+      const choice = interaction.values[0];
+      action.decisions = action.decisions || {};
+
+      if (choice === ROLE_SELECT_SKIP_VALUE) {
+        action.decisions[missingRoleId] = { mode: 'remove' };
+      } else {
+        action.decisions[missingRoleId] = { mode: 'replace', targetRoleId: choice };
+      }
+
+      const { embed, components } = buildRoleResolutionMessage(action, guild);
+      await interaction.update({ embeds: [embed], components }).catch(() => {});
+      return;
+    }
+
     if (interaction.isButton()) {
       const { customId } = interaction;
+
+      if (customId.startsWith(MAINTENANCE_ROLE_RESOLVE_PREFIX)) {
+        const [actionId, command] = customId.slice(MAINTENANCE_ROLE_RESOLVE_PREFIX.length).split(':');
+        const guild = interaction.guild;
+        const action = getPendingAction(actionId);
+
+        if (!guild || !action || action.type !== 'disableResolve' || action.guildId !== guild.id) {
+          await safeReply(interaction, { content: 'This maintenance request is no longer available.' }).catch(() => {});
+          return;
+        }
+
+        if (interaction.user.id !== action.userId) {
+          await safeReply(interaction, {
+            content: `Only <@${action.userId}> can adjust this restore.`,
+          }).catch(() => {});
+          return;
+        }
+
+        if (command === 'cancel') {
+          removePendingAction(actionId);
+          const embed = buildMaintenanceEmbed({
+            title: 'Action Cancelled',
+            description: 'No changes were made.',
+            color: EMBED_COLORS.info,
+            footer: { text: guild.name },
+          });
+          await interaction.update({ embeds: [embed], components: [] }).catch(() => {});
+          return;
+        }
+
+        const unresolved = action.missingRoles.filter((missing) => !action.decisions?.[missing.id]);
+        if (unresolved.length > 0) {
+          await safeReply(interaction, { content: 'Resolve each missing role before finalizing.' }).catch(() => {});
+          return;
+        }
+
+        const roleMapping = {};
+        for (const missing of action.missingRoles) {
+          const decision = action.decisions?.[missing.id];
+          if (!decision) {
+            continue;
+          }
+          if (decision.mode === 'replace') {
+            roleMapping[missing.id] = { action: 'replace', targetRoleId: decision.targetRoleId };
+          } else {
+            roleMapping[missing.id] = { action: 'remove' };
+          }
+        }
+
+        try {
+          const result = await performMaintenanceDisable({
+            guild,
+            requestedById: action.userId,
+            roleMapping,
+          });
+
+          if (result.missingRoles && result.missingRoles.length > 0) {
+            removePendingAction(actionId);
+            const newAction = registerPendingAction({
+              id: actionId,
+              type: 'disableResolve',
+              guildId: guild.id,
+              userId: action.userId,
+              missingRoles: result.missingRoles,
+              decisions: {},
+            });
+            const { embed, components } = buildRoleResolutionMessage(newAction, guild);
+            await interaction.update({ embeds: [embed], components }).catch(() => {});
+            return;
+          }
+
+          removePendingAction(actionId);
+
+          const embed = buildMaintenanceEmbed({
+            title: 'Maintenance Disabled',
+            description: 'Maintenance mode has been turned off.',
+            color: EMBED_COLORS.success,
+            footer: { text: guild.name },
+          });
+          await interaction.update({ embeds: [embed], components: [] }).catch(() => {});
+          await safeFollowUp(interaction, { content: result.reply }).catch(() => {});
+        } catch (error) {
+          logger.error('Failed to apply maintenance role mappings', error);
+          await safeFollowUp(interaction, {
+            content: 'Failed to apply maintenance changes. Check the bot logs.',
+          }).catch(() => {});
+        }
+
+        return;
+      }
 
       if (customId.startsWith(MAINTENANCE_CONFIRM_PREFIX) || customId.startsWith(MAINTENANCE_CANCEL_PREFIX)) {
         const guild = interaction.guild;
@@ -629,6 +905,21 @@ function createLockBot({
             await safeFollowUp(interaction, { content: result.reply }).catch(() => {});
           } else {
             const result = await performMaintenanceDisable({ guild, requestedById: stored.userId });
+
+            if (result.missingRoles && result.missingRoles.length > 0) {
+              const resolveAction = registerPendingAction({
+                id: baseId,
+                type: 'disableResolve',
+                guildId: guild.id,
+                userId: stored.userId,
+                missingRoles: result.missingRoles,
+                decisions: {},
+              });
+
+              const { embed, components } = buildRoleResolutionMessage(resolveAction, guild);
+              await interaction.editReply({ embeds: [embed], components }).catch(() => {});
+              return;
+            }
 
             try {
               const embed = buildMaintenanceEmbed({

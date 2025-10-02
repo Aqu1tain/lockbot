@@ -253,6 +253,22 @@ class MaintenanceManager {
         }
       }
 
+      const roleIdsForSnapshots = new Set();
+      for (const snapshot of Object.values(memberRoleSnapshots)) {
+        for (const roleId of snapshot.roles || []) {
+          roleIdsForSnapshots.add(roleId);
+        }
+      }
+
+      const roleChannelSnapshots = {};
+      for (const roleId of roleIdsForSnapshots) {
+        const role = guild.roles.cache.get(roleId);
+        roleChannelSnapshots[roleId] = {
+          name: role?.name || `Role ${roleId}`,
+          channels: {},
+        };
+      }
+
       const channelPermissionSnapshots = {};
       let channelsLocked = 0;
 
@@ -266,6 +282,18 @@ class MaintenanceManager {
         const hadDeny = overwrite?.deny.has(PermissionsBitField.Flags.ViewChannel) ?? false;
         const previous = hadAllow ? 'allow' : hadDeny ? 'deny' : 'neutral';
         channelPermissionSnapshots[channel.id] = previous;
+
+        for (const roleId of roleIdsForSnapshots) {
+          const snapshot = roleChannelSnapshots[roleId];
+          if (!snapshot) {
+            continue;
+          }
+          const roleOverwrite = channel.permissionOverwrites.cache.get(roleId);
+          const roleAllow = roleOverwrite?.allow.has(PermissionsBitField.Flags.ViewChannel) ?? false;
+          const roleDeny = roleOverwrite?.deny.has(PermissionsBitField.Flags.ViewChannel) ?? false;
+          const roleState = roleAllow ? 'allow' : roleDeny ? 'deny' : 'neutral';
+          snapshot.channels[channel.id] = roleState;
+        }
 
         if (channel.id === maintenanceChannel.id) {
           continue;
@@ -297,6 +325,7 @@ class MaintenanceManager {
         shouldDeleteBypassRole: createdBypass,
         memberRoleSnapshots,
         channelPermissionSnapshots,
+        roleChannelSnapshots,
         everyoneViewPermission: hadViewPermission ? 'allow' : 'deny',
         timeoutAt,
         timeoutSetBy,
@@ -305,7 +334,9 @@ class MaintenanceManager {
     });
   }
 
-  async disable(guild) {
+  async disable(guild, options = {}) {
+    const roleMapping = options.roleMapping ?? {};
+
     await Promise.all([guild.members.fetch(), guild.roles.fetch(), guild.channels.fetch()]);
 
     return this.stateManager.updateGuildState(guild.id, async (current) => {
@@ -334,17 +365,23 @@ class MaintenanceManager {
           continue;
         }
 
-        const desiredRoles = [];
+        const desiredRoleSet = new Set();
         for (const roleId of snapshot.roles || []) {
           if (guild.roles.cache.has(roleId)) {
-            desiredRoles.push(roleId);
+            desiredRoleSet.add(roleId);
+            continue;
+          }
+
+          const decision = roleMapping[roleId];
+          if (decision?.action === 'replace' && guild.roles.cache.has(decision.targetRoleId)) {
+            desiredRoleSet.add(decision.targetRoleId);
           } else {
             logs.push(`Role ${roleId} missing when restoring ${member.user.tag} (${member.id}).`);
           }
         }
 
         try {
-          await member.roles.set(desiredRoles, 'Maintenance mode disabled');
+          await member.roles.set(Array.from(desiredRoleSet), 'Maintenance mode disabled');
           restoredMembers += 1;
         } catch (error) {
           logs.push(`Failed to restore roles for ${member.user.tag} (${member.id}): ${error.name}`);
@@ -380,24 +417,61 @@ class MaintenanceManager {
           continue;
         }
 
-        let payload;
-        if (previous === 'allow') {
-          payload = { ViewChannel: true };
-        } else if (previous === 'deny') {
-          payload = { ViewChannel: false };
-        } else {
-          payload = { ViewChannel: null };
-        }
-
         try {
-          await channel.permissionOverwrites.edit(
-            everyoneRole,
-            payload,
-            { reason: 'Maintenance mode disabled' }
-          );
+          if (previous === 'neutral') {
+            await channel.permissionOverwrites.delete(everyoneRole, 'Maintenance mode disabled');
+          } else {
+            await channel.permissionOverwrites.edit(
+              everyoneRole,
+              { ViewChannel: previous === 'allow' },
+              { reason: 'Maintenance mode disabled' }
+            );
+          }
           channelsRestored += 1;
         } catch (error) {
           logs.push(`Failed to restore @everyone overwrite in ${channel?.name ?? channelId}: ${error.name}`);
+        }
+      }
+
+      if (current.roleChannelSnapshots) {
+        for (const [missingRoleId, decision] of Object.entries(roleMapping)) {
+          if (decision?.action !== 'replace') {
+            continue;
+          }
+
+          const snapshot = current.roleChannelSnapshots[missingRoleId];
+          if (!snapshot) {
+            continue;
+          }
+
+          const targetRole = guild.roles.cache.get(decision.targetRoleId) || (await guild.roles.fetch(decision.targetRoleId).catch(() => null));
+          if (!targetRole) {
+            logs.push(`Replacement role ${decision.targetRoleId} missing when restoring snapshot for ${missingRoleId}.`);
+            continue;
+          }
+
+          for (const [channelId, viewState] of Object.entries(snapshot.channels || {})) {
+            const channel = guild.channels.cache.get(channelId) || (await guild.channels.fetch(channelId).catch(() => null));
+            if (!channel || !channel.manageable) {
+              continue;
+            }
+
+            try {
+              if (viewState === 'neutral') {
+                if (channel.permissionOverwrites.cache.has(targetRole.id)) {
+                  await channel.permissionOverwrites.delete(targetRole, 'Maintenance role replacement');
+                }
+              } else {
+                await channel.permissionOverwrites.edit(
+                  targetRole,
+                  { ViewChannel: viewState === 'allow' },
+                  { reason: 'Maintenance role replacement' }
+                );
+              }
+            } catch (error) {
+              logs.push(`Failed to apply replacement overwrite in ${channel?.name ?? channelId} for role ${targetRole.id}: ${error.name}`);
+            }
+          }
         }
       }
 
@@ -427,6 +501,19 @@ class MaintenanceManager {
         await bypassRole.delete('Cleanup maintenance bypass role').catch(() => {});
       }
 
+      for (const [roleId, decision] of Object.entries(roleMapping)) {
+        if (!decision) {
+          continue;
+        }
+        const snapshot = current.roleChannelSnapshots?.[roleId];
+        const roleName = snapshot?.name || `Role ${roleId}`;
+        if (decision.action === 'replace') {
+          logs.push(`Replaced ${roleName} with <@&${decision.targetRoleId}> during restore.`);
+        } else if (decision.action === 'remove') {
+          logs.push(`Removed ${roleName} from affected members during restore.`);
+        }
+      }
+
       logs.push(`Maintenance disabled — restored ${restoredMembers} members and ${channelsRestored} channels.`);
 
       return {
@@ -439,6 +526,7 @@ class MaintenanceManager {
         shouldDeleteBypassRole: false,
         memberRoleSnapshots: {},
         channelPermissionSnapshots: {},
+        roleChannelSnapshots: {},
         everyoneViewPermission: null,
         timeoutAt: null,
         timeoutSetBy: null,
