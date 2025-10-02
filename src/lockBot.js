@@ -166,7 +166,9 @@ function createLockBot({
 
     try {
       if (interaction.deferred || interaction.replied) {
-        await interaction.editReply(normalized);
+        const editablePayload = { ...normalized };
+        delete editablePayload.flags;
+        await interaction.editReply(editablePayload);
         return;
       }
 
@@ -174,7 +176,8 @@ function createLockBot({
     } catch (error) {
       if (error?.code === 10008) {
         try {
-          await interaction.followUp(normalized);
+          const followPayload = { ...normalized };
+          await interaction.followUp(followPayload);
         } catch (followError) {
           logger.error('Failed to send follow-up after edit failure', followError);
         }
@@ -667,8 +670,10 @@ If you need urgent help, reach out to an administrator.`,
       return;
     }
 
+    const subcommand = interaction.options.getSubcommand();
     const memberPermissions = interaction.memberPermissions;
-    if (!memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+    const isAdmin = memberPermissions?.has(PermissionFlagsBits.Administrator);
+    if (!isAdmin && subcommand !== 'status') {
       await safeReply(interaction, {
         content: 'You need administrator permissions to manage maintenance mode.',
       });
@@ -678,7 +683,6 @@ If you need urgent help, reach out to an administrator.`,
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     try {
-      const subcommand = interaction.options.getSubcommand();
 
       if (subcommand === 'enable') {
         const durationMinutes = interaction.options.getInteger('duration_minutes');

@@ -15,8 +15,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('maintenance')
     .setDescription('Server maintenance controls')
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addSubcommand((subcommand) =>
+        .addSubcommand((subcommand) =>
       subcommand
         .setName('enable')
         .setDescription('Enable maintenance mode')
