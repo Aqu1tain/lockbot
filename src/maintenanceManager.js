@@ -158,7 +158,6 @@ class MaintenanceManager {
       guild,
       roleId: state.maintenanceBypassRoleId,
       roleName: BYPASS_ROLE_NAME,
-      permissions: null,
       reason: 'Maintenance mode setup: bypass role',
       managedCallback: async (role) => {
         const perms = new PermissionsBitField(role.permissions);
@@ -186,7 +185,7 @@ class MaintenanceManager {
   async enable(guild, options = {}) {
     const { timeoutAt = null, timeoutSetBy = null } = options;
 
-    await guild.members.fetch();
+    await Promise.all([guild.members.fetch(), guild.roles.fetch(), guild.channels.fetch()]);
 
     return this.stateManager.updateGuildState(guild.id, async (current) => {
       if (current.enabled) {
@@ -195,11 +194,18 @@ class MaintenanceManager {
 
       const logs = Array.isArray(current.logs) ? [...current.logs] : [];
 
-      const { tempRole, bypassRole, createdTemp, createdBypass } =
-        await this.ensureMaintenanceInfrastructure(guild, current);
+      const {
+        tempRole,
+        bypassRole,
+        createdTemp,
+        createdBypass,
+      } = await this.ensureMaintenanceInfrastructure(guild, current);
 
-      const { channel: maintenanceChannel, created: createdChannel } =
-        await this.findOrCreateMaintenanceChannel(guild, current, { tempRole, bypassRole });
+      const { channel: maintenanceChannel, created: createdChannel } = await this.findOrCreateMaintenanceChannel(
+        guild,
+        current,
+        { tempRole, bypassRole }
+      );
 
       const memberRoleSnapshots = {};
       let affectedMembers = 0;
@@ -247,8 +253,38 @@ class MaintenanceManager {
         }
       }
 
+      const channelPermissionSnapshots = {};
+      let channelsLocked = 0;
+
+      for (const channel of guild.channels.cache.values()) {
+        if (channel.isThread?.() || !channel.manageable) {
+          continue;
+        }
+
+        const overwrite = channel.permissionOverwrites.cache.get(everyoneRole.id);
+        const hadAllow = overwrite?.allow.has(PermissionsBitField.Flags.ViewChannel) ?? false;
+        const hadDeny = overwrite?.deny.has(PermissionsBitField.Flags.ViewChannel) ?? false;
+        const previous = hadAllow ? 'allow' : hadDeny ? 'deny' : 'neutral';
+        channelPermissionSnapshots[channel.id] = previous;
+
+        if (channel.id === maintenanceChannel.id) {
+          continue;
+        }
+
+        try {
+          await channel.permissionOverwrites.edit(
+            everyoneRole,
+            { ViewChannel: false },
+            { reason: 'Maintenance mode activated' }
+          );
+          channelsLocked += 1;
+        } catch (error) {
+          logs.push(`Failed to update @everyone overwrite in ${channel.name} (${channel.id}): ${error.name}`);
+        }
+      }
+
       logs.push(
-        `Maintenance enabled by ${timeoutSetBy ? `<@${timeoutSetBy}>` : 'system'} — locked ${affectedMembers} members.`
+        `Maintenance enabled by ${timeoutSetBy ? `<@${timeoutSetBy}>` : 'system'} — locked ${affectedMembers} members and ${channelsLocked} channels.`
       );
 
       return {
@@ -260,6 +296,7 @@ class MaintenanceManager {
         maintenanceBypassRoleId: bypassRole.id,
         shouldDeleteBypassRole: createdBypass,
         memberRoleSnapshots,
+        channelPermissionSnapshots,
         everyoneViewPermission: hadViewPermission ? 'allow' : 'deny',
         timeoutAt,
         timeoutSetBy,
@@ -269,7 +306,7 @@ class MaintenanceManager {
   }
 
   async disable(guild) {
-    await Promise.all([guild.members.fetch(), guild.roles.fetch()]);
+    await Promise.all([guild.members.fetch(), guild.roles.fetch(), guild.channels.fetch()]);
 
     return this.stateManager.updateGuildState(guild.id, async (current) => {
       if (!current.enabled) {
@@ -322,8 +359,8 @@ class MaintenanceManager {
         ).catch(() => {});
       }
 
+      const everyoneRole = guild.roles.everyone;
       if (current.everyoneViewPermission === 'allow') {
-        const everyoneRole = guild.roles.everyone;
         if (!everyoneRole.permissions.has(PermissionFlagsBits.ViewChannel)) {
           try {
             await everyoneRole.setPermissions(
@@ -336,6 +373,34 @@ class MaintenanceManager {
         }
       }
 
+      let channelsRestored = 0;
+      for (const [channelId, previous] of Object.entries(current.channelPermissionSnapshots || {})) {
+        const channel = guild.channels.cache.get(channelId) || (await guild.channels.fetch(channelId).catch(() => null));
+        if (!channel || !channel.manageable) {
+          continue;
+        }
+
+        let payload;
+        if (previous === 'allow') {
+          payload = { ViewChannel: true };
+        } else if (previous === 'deny') {
+          payload = { ViewChannel: false };
+        } else {
+          payload = { ViewChannel: null };
+        }
+
+        try {
+          await channel.permissionOverwrites.edit(
+            everyoneRole,
+            payload,
+            { reason: 'Maintenance mode disabled' }
+          );
+          channelsRestored += 1;
+        } catch (error) {
+          logs.push(`Failed to restore @everyone overwrite in ${channel?.name ?? channelId}: ${error.name}`);
+        }
+      }
+
       if (current.maintenanceChannelId) {
         const channel = await guild.channels.fetch(current.maintenanceChannelId).catch(() => null);
         if (channel) {
@@ -343,7 +408,7 @@ class MaintenanceManager {
             await channel.delete('Maintenance mode disabled').catch(() => {});
           } else {
             await channel.setRateLimitPerUser(0, 'Maintenance mode disabled').catch(() => {});
-            await channel.permissionOverwrites.delete(guild.roles.everyone, 'Maintenance teardown').catch(() => {});
+            await channel.permissionOverwrites.delete(everyoneRole, 'Maintenance teardown').catch(() => {});
             if (tempRole) {
               await channel.permissionOverwrites.delete(tempRole, 'Maintenance teardown').catch(() => {});
             }
@@ -362,7 +427,7 @@ class MaintenanceManager {
         await bypassRole.delete('Cleanup maintenance bypass role').catch(() => {});
       }
 
-      logs.push(`Maintenance disabled — restored ${restoredMembers} members.`);
+      logs.push(`Maintenance disabled — restored ${restoredMembers} members and ${channelsRestored} channels.`);
 
       return {
         enabled: false,
@@ -373,6 +438,7 @@ class MaintenanceManager {
         maintenanceBypassRoleId: current.shouldDeleteBypassRole ? null : current.maintenanceBypassRoleId,
         shouldDeleteBypassRole: false,
         memberRoleSnapshots: {},
+        channelPermissionSnapshots: {},
         everyoneViewPermission: null,
         timeoutAt: null,
         timeoutSetBy: null,

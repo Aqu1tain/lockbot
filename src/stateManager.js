@@ -10,6 +10,7 @@ const DEFAULT_GUILD_STATE = {
   maintenanceBypassRoleId: null,
   shouldDeleteBypassRole: false,
   memberRoleSnapshots: {},
+  channelPermissionSnapshots: {},
   everyoneViewPermission: null,
   timeoutAt: null,
   timeoutSetBy: null,

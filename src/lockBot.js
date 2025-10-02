@@ -229,6 +229,15 @@ function createLockBot({
       });
     }
 
+    if (state.channelPermissionSnapshots) {
+      const channelsLocked = Object.keys(state.channelPermissionSnapshots).length;
+      fields.push({
+        name: 'Channels Locked',
+        value: `${channelsLocked}`,
+        inline: true,
+      });
+    }
+
     if (state.maintenanceTempRoleId) {
       fields.push({
         name: 'Temporary Role',
@@ -307,11 +316,18 @@ function createLockBot({
 
     const lockedCount = Object.keys(state.memberRoleSnapshots || {}).length;
 
+    const channelsLocked = Object.keys(state.channelPermissionSnapshots || {}).length;
+
     const fields = [
       { name: 'Triggered by', value: `<@${requestedById}>`, inline: true },
       {
         name: 'Members Locked',
         value: `${lockedCount}`,
+        inline: true,
+      },
+      {
+        name: 'Channels Locked',
+        value: `${channelsLocked}`,
         inline: true,
       },
       {
@@ -342,7 +358,7 @@ function createLockBot({
     stateCache.set(guild.id, state);
     scheduleAutoDisable(guild, state);
 
-    let reply = `Maintenance mode enabled. Locked ${lockedCount} member${lockedCount === 1 ? '' : 's'} to the maintenance role.`;
+    let reply = `Maintenance mode enabled. Locked ${lockedCount} member${lockedCount === 1 ? '' : 's'} across ${channelsLocked} channel${channelsLocked === 1 ? '' : 's'}.`;
     if (timeoutUnix) {
       reply += ` Auto-disable scheduled for <t:${timeoutUnix}:f> (<t:${timeoutUnix}:R>).`;
     }
@@ -380,7 +396,8 @@ function createLockBot({
     stateCache.set(guild.id, state);
 
     const expectedRestoreCount = Object.keys(stateBeforeDisable.memberRoleSnapshots || {}).length;
-    const reply = `Maintenance mode disabled. Restored up to ${expectedRestoreCount} member${expectedRestoreCount === 1 ? '' : 's'}.`;
+    const expectedChannelCount = Object.keys(stateBeforeDisable.channelPermissionSnapshots || {}).length;
+    const reply = `Maintenance mode disabled. Restored up to ${expectedRestoreCount} member${expectedRestoreCount === 1 ? '' : 's'} and ${expectedChannelCount} channel${expectedChannelCount === 1 ? '' : 's'}.`;
 
     return { state, reply };
   }

@@ -6,7 +6,7 @@ LockBot is a reusable Discord bot helper built with [discord.js](https://discord
 
 - Slash command `/maintenance` with `enable`, `disable`, and `status` subcommands (administrator-only).
 - Works across any guild the bot joins—no guild IDs hard-coded.
-- Automatically hides every channel from non-admin roles while maintenance is active and restores previous visibility when complete.
+- Automatically hides every channel from non-admin roles while maintenance is active, swaps members into a temporary role, and restores their exact role loadout afterward.
 - Creates a configurable, read-only maintenance text channel on demand.
 - Any new channel created while maintenance is active is hidden from non-admins automatically.
 - Optional auto-timeouts bring the server back online after a set duration.
@@ -74,7 +74,7 @@ You can further customise the bot by adjusting the `maintenanceChannelName`, sup
 - Enable/disable commands prompt the initiating admin for confirmation before changes apply.
 - Any permission edits you make during maintenance stick around—LockBot only reverts overwrites it is still actively enforcing.
 
-During maintenance the bot automatically ensures two helper roles exist: `maintenance-temp` (assigned to all affected members) and `maintenance-bypass` (granting permanent visibility for staff you assign it to). Feel free to tweak permissions while maintenance is active—the bot only restores overwrites it is still enforcing, so any manual edits you make remain in place after the unlock.
+During maintenance the bot automatically ensures two helper roles exist: `maintenance-temp` (assigned to all affected members) and `maintenance-bypass` (granting permanent visibility for staff you assign it to). It also stamps a `View Channel` deny for `@everyone` across every channel (aside from the maintenance room) so the lockdown is airtight. Feel free to tweak permissions while maintenance is active—the bot only restores overwrites it is still enforcing, so any manual edits you make remain in place after the unlock.
 
 ## State Persistence
 
